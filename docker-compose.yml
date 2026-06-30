@@ -1,0 +1,237 @@
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: fraud_detection-namenode
+    environment:
+      - CLUSTER_NAME=CI2
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_replication=1   # <-- ajoute cette ligne
+
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hdfs_namenode:/hadoop/dfs/name
+    networks:
+      - ci2-network
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: fraud_detection-datanode
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_replication=1 
+    depends_on:
+      - namenode
+    volumes:
+      - hdfs_datanode:/hadoop/dfs/data
+    networks:
+      - ci2-network
+
+  postgres-metastore:
+    image: postgres:13
+    container_name: fraud_detection-postgres-metastore
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive_password
+    volumes:
+      - postgres_metastore_data:/var/lib/postgresql/data
+      - ./postgres/hive-schema.sql:/docker-entrypoint-initdb.d/hive-schema.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - ci2-network
+
+  hive-metastore:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: fraud_detection-hive-metastore
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870 datanode:9864 postgres-metastore:5432
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - CORE_CONF_hadoop_http_staticuser_user=root
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://postgres-metastore/metastore
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName=org.postgresql.Driver
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName=hive
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword=hive_password
+      - HIVE_SITE_CONF_datanucleus_autoCreateSchema=true
+      - HIVE_SITE_CONF_datanucleus_schema_autoCreateAll=true
+      - HIVE_SITE_CONF_datanucleus_schema_autoCreateTables=true
+      - HIVE_SITE_CONF_hive_metastore_schema_verification=false
+      - HIVE_SITE_CONF_hive_metastore_uris=thrift://hive-metastore:9083
+    depends_on:
+      - postgres-metastore
+      - namenode
+      - datanode
+    ports:
+      - "9083:9083"
+    command: /opt/hive/bin/hive --service metastore
+    networks:
+      - ci2-network
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: fraud_detection-trino
+    depends_on:
+      - hive-metastore
+      - namenode
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    networks:
+      - ci2-network
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: fraud_detection-metabase
+    environment:
+      MB_DB_TYPE: h2
+    ports:
+      - "3000:3000"
+    networks:
+      - ci2-network
+
+  fastapi:
+    build: ./api
+    container_name: fraud_detection-fastapi
+    depends_on:
+      - trino
+      - postgres-metastore
+    ports:
+      - "8000:8000"
+    environment:
+      - MODEL_PATH=/ml/models/fraud_detector_latest.pkl
+      - TRINO_HOST=trino
+      - TRINO_PORT=8080
+    volumes:
+      - ./ml/models:/ml/models
+    networks:
+      - ci2-network
+
+  frontend:
+    build: ./frontend
+    container_name: fraud_detection-frontend
+    ports:
+      - "8501:8501"
+    depends_on:
+      - fastapi
+    networks:
+      - ci2-network
+
+  postgres-airflow:
+    image: postgres:13
+    container_name: fraud_detection-postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    networks:
+      - ci2-network
+
+  redis:
+    image: redis:6
+    container_name: fraud_detection-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - ci2-network
+
+  airflow-init:
+    build: ./airflow
+    image: fraud_detection-airflow-init:latest
+    container_name: fraud_detection-airflow-init
+    depends_on:
+      - postgres-airflow
+      - redis
+    entrypoint: ["/bin/bash", "-c", "airflow db upgrade || true && airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true"]
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      - AIRFLOW__WEBSERVER__SECRET_KEY=Y3uB1niaFv7qbKzN8rM5hg==
+      - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8085
+      - AIRFLOW__WEBSERVER__WEB_SERVER_HOST=0.0.0.0
+      - AIRFLOW__WEBSERVER__WEB_SERVER_PORT=8080
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=False
+      - AIRFLOW__CORE__HOSTNAME_CALLABLE=airflow.utils.net:get_host_ip_address
+      - AIRFLOW__LOGGING__BASE_LOG_FOLDER=/opt/airflow/logs
+      - AIRFLOW__LOGGING__LOG_FILENAME_TEMPLATE="{{ ti.dag_id }}/{{ ti.run_id }}/{{ ti.task_id }}/{{ ti.try_number }}.log"
+      - AIRFLOW__WEBSERVER__LOG_FETCH_TIMEOUT_SEC=30
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/project:rw
+      - ./logs:/opt/airflow/logs
+    networks:
+      - ci2-network
+
+  airflow-webserver:
+    build: ./airflow
+    image: fraud_detection-airflow-webserver:latest
+    container_name: fraud_detection-airflow-webserver
+    depends_on:
+      - airflow-init
+    command: webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      - AIRFLOW__WEBSERVER__SECRET_KEY=Y3uB1niaFv7qbKzN8rM5hg==
+      - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8085
+      - AIRFLOW__WEBSERVER__WEB_SERVER_HOST=0.0.0.0
+      - AIRFLOW__WEBSERVER__WEB_SERVER_PORT=8080
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=False
+      - AIRFLOW__CORE__HOSTNAME_CALLABLE=airflow.utils.net:get_host_ip_address
+      - AIRFLOW__LOGGING__BASE_LOG_FOLDER=/opt/airflow/logs
+      - AIRFLOW__LOGGING__LOG_FILENAME_TEMPLATE="{{ ti.dag_id }}/{{ ti.run_id }}/{{ ti.task_id }}/{{ ti.try_number }}.log"
+      - AIRFLOW__WEBSERVER__LOG_FETCH_TIMEOUT_SEC=30
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/project:ro
+      - ./logs:/opt/airflow/logs
+      - ./ml/models:/project/ml/models:rw 
+    networks:
+      - ci2-network
+
+  airflow-scheduler:
+    build: ./airflow
+    image: fraud_detection-airflow-scheduler:latest
+    container_name: fraud_detection-airflow-scheduler
+    depends_on:
+      - airflow-init
+    command: scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      - AIRFLOW__WEBSERVER__SECRET_KEY=Y3uB1niaFv7qbKzN8rM5hg==
+      - AIRFLOW__WEBSERVER__BASE_URL=http://localhost:8085
+      - AIRFLOW__WEBSERVER__WEB_SERVER_HOST=0.0.0.0
+      - AIRFLOW__WEBSERVER__WEB_SERVER_PORT=8080
+      - AIRFLOW__LOGGING__REMOTE_LOGGING=False
+      - AIRFLOW__CORE__HOSTNAME_CALLABLE=airflow.utils.net:get_host_ip_address
+      - AIRFLOW__LOGGING__BASE_LOG_FOLDER=/opt/airflow/logs
+      - AIRFLOW__LOGGING__LOG_FILENAME_TEMPLATE="{{ ti.dag_id }}/{{ ti.run_id }}/{{ ti.task_id }}/{{ ti.try_number }}.log"
+      - AIRFLOW__WEBSERVER__LOG_FETCH_TIMEOUT_SEC=30
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/project:rw
+      - ./logs:/opt/airflow/logs
+    networks:
+      - ci2-network
+
+volumes:
+  hdfs_namenode:
+  hdfs_datanode:
+  postgres_metastore_data:
+  postgres_airflow_data:
+  metabase_db:
+
+networks:
+  ci2-network:
+    driver: bridge

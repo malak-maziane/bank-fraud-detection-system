@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+airflow/*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Hadoop / Spark / temporary data
+tmp/
+data/bronze/
+data/silver/
+data/gold/
+ml/models/
+
+# IDEs
+.vscode/
+.idea/
+
+# Python package distribution
+*.egg-info/
+build/
+dist/
+
+# Misc
+*.swp
+*.pid
